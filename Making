@@ -4,15 +4,15 @@
 Unified-Grid SED pipeline (adaptive ~30k; all float64; HDF5 4GB-chunk safe)
 
 - Grid: ADAPT_WAVE (~30k) shared by Stellar / AGN / Nebular / Final
-- Stage A (stellar_adapt.h5): Stellar SED (ADAPT), Q_H(f64), Z_abs_mw(f64)   [vectorized, no block/fallback]
+- Stage A (stellar_adapt.h5): Stellar SED (ADAPT), Q_H(f64)
 - Stage B (agn_adapt.h5)    : AGN SED (ADAPT)
-- Stage C (neb_adapt.h5)    : Nebular SED (ADAPT) using (Q_H, Z_abs)
+- Stage C (neb_adapt.h5)    : Nebular SED (ADAPT) using (Q_H, Z_gas) and Te(Z_gas)
 - Stage D (final.h5)        : Merge (no re-interp), attenuation on (stellar+nebular+agn),
-                              dust (Casey12, T=40K, energy-balance to absorbed (stellar+neb+agn)),
+                              dust (Casey12, T=25K, energy-balance to absorbed (stellar+neb+agn)),
                               sum (7 datasets)
 - Cleanup                   : Remove temp files
 
-All datasets float64.
+All datasets are float64.
 """
 
 # ===== Environment (pin cores / avoid oversubscription) =====
@@ -23,12 +23,16 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import re, glob, math, threading, atexit
+import atexit
+import glob
+import math
+import re
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
 import h5py
 import numpy as np
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from astropy.cosmology import FlatLambdaCDM
+from tqdm import tqdm
 
 # =========================
 # 0) Paths / Parameters
@@ -36,22 +40,60 @@ from astropy.cosmology import FlatLambdaCDM
 SNAP = "/data2/fukushima/L200N1024/snapshot_020.hdf5"
 FOF  = "/data2/fukushima/L200N1024/fof_subhalo_tab_020.hdf5"
 
-CUBE_DIR      = "/data/grqtm/Research/Keita/MIST_cube"
-SKIRTOR_DIR   = "/data/grqtm/Research/Keita/Template/SKIRTOR/SKIRTOR_data"
-NEB_TPL_DIR   = "/data/grqtm/Research/Keita/Template/Nebular/forMawatari_17Jul"
-NEB_LINE_FILE = os.path.join(NEB_TPL_DIR, "LineRatio_nodust_May2016-2.txt")
-NEB_CONT_FILE = os.path.join(NEB_TPL_DIR, "rspec_cont_fe00.txt")
+Stellar_DIR   = "/data/grqtm/Research/Keita/MIST_cube"
+AGN_DIR       = "/data/grqtm/Research/Keita/Template/SKIRTOR/SKIRTOR_data"
+Nebular_DIR   = "/data/grqtm/Research/Keita/Template/Nebular/forMawatari_17Jul"
 
-OUT_FINAL   = "2_Final_SEDs_z0_adapt_f64.hdf5"   # final file (7 datasets; float64)
+NEB_LINE_FILE = os.path.join(Nebular_DIR, "LineRatio_nodust_May2016-2.txt")
+NEB_CONT_FILE = os.path.join(Nebular_DIR, "rspec_cont_fe00.txt")
+
+OUT_FINAL = "SEDs.hdf5"
 TMP_STELLAR = "stellar_adapt_f64.h5"
 TMP_AGN     = "agn_adapt_f64.h5"
 TMP_NEB     = "nebular_adapt_f64.h5"
 
+# =========================
+# Save options (final datasets)
+# =========================
+# Toggle which final datasets to save.
+SAVE_SETS = {
+    "stellar_sed": True,
+    "nebular_sed": True,
+    "stellar_plus_nebular": True,
+    "stellar_nebular_agn_attenuated": True,
+    "dust_emission_sed": True,
+    "agn_sed": True,
+    "total_sed": True,
+}
+def SAVE(name: str) -> bool:
+    return bool(SAVE_SETS.get(name, False))
+
+# =========================
 # Selection / Execution
+# =========================
 MSTAR_THRESH   = 1.0e9       # Msun
-N_THREADS      = 7           # worker threads
-TARGET_RAM_GB  = 100.0       # total RAM budget (upper bound)
-SAFETY_RAM_GB  = 8.0         # safety headroom
+_CPU_COUNT = max(1, int(os.cpu_count() or 1))
+
+# User tuning (edit these values directly for your server profile)
+USER_THREADS = 20
+USER_TARGET_RAM_GB = 150.0
+USER_SAFETY_RAM_GB = 16.0
+USER_BLOCK_ROWS_STAGE_A = 24
+USER_BLOCK_ROWS_STAGE_B = 96
+USER_BLOCK_ROWS_STAGE_C = 24
+USER_MAX_INFLIGHT_BLOCKS = max(2, USER_THREADS * 3)
+
+# Optional env overrides keep the same behavior for batch runs.
+N_THREADS = int(os.environ.get("SED_THREADS", str(USER_THREADS)))
+N_THREADS = max(1, min(N_THREADS, _CPU_COUNT))
+TARGET_RAM_GB = float(os.environ.get("SED_TARGET_RAM_GB", str(USER_TARGET_RAM_GB)))
+SAFETY_RAM_GB = float(os.environ.get("SED_SAFETY_RAM_GB", str(USER_SAFETY_RAM_GB)))
+
+# Row-block settings for bounded parallel scheduling.
+BLOCK_ROWS_STAGE_A = max(1, int(os.environ.get("SED_BLOCK_ROWS_STAGE_A", str(USER_BLOCK_ROWS_STAGE_A))))
+BLOCK_ROWS_STAGE_B = max(1, int(os.environ.get("SED_BLOCK_ROWS_STAGE_B", str(USER_BLOCK_ROWS_STAGE_B))))
+BLOCK_ROWS_STAGE_C = max(1, int(os.environ.get("SED_BLOCK_ROWS_STAGE_C", str(USER_BLOCK_ROWS_STAGE_C))))
+MAX_INFLIGHT_BLOCKS = max(2, int(os.environ.get("SED_MAX_INFLIGHT_BLOCKS", str(USER_MAX_INFLIGHT_BLOCKS))))
 
 # Cosmology / constants / units
 cosmo  = FlatLambdaCDM(H0=67.742, Om0=0.3099)
@@ -65,35 +107,74 @@ h_ergs = 6.62607015e-27
 kB     = 1.380649e-16
 Lsun   = 3.839e33
 
-# Adaptive wavelength grid (float64, built at runtime)
-ADAPT_WAVE = None  # set by build_adaptive_wave()
+ADAPT_WAVE = None
 
-# Calzetti (2000)
-E_B_V    = 0.39
+# Calzetti (2000) + Hayes (2011) E(B-V)(z)
 RV_PRIME = 4.05
 
+# Hayes+2011: E(B-V)(z) = C_EBV * exp(-z / Z_EBV)
+C_EBV_HAYES = 0.386
+Z_EBV_HAYES = 3.42
+def ebv_from_redshift(z, C_EBV=C_EBV_HAYES, z_EBV=Z_EBV_HAYES):
+    """Return mean E(B-V) as a function of redshift z (Hayes+2011)."""
+    z = float(z)
+    return float(C_EBV * math.exp(-z / z_EBV))
+
 # Casey (2012) (exact in ν-space, convert to S_lambda)
+T_dust = 25.0
 CASEY_BETA       = 1.60
 CASEY_ALPHA      = 2.0
 CASEY_LAMBDA0_UM = 200.0
 # Dust energy balance: absorption integration range / dust emission range
 L_ABS_MIN_UM, L_ABS_MAX_UM = 0.0912, 10.0
-IR_MIN_UM,  IR_MAX_UM      = 8.0, 10000.0
+IR_MIN_UM,  IR_MAX_UM      = 3.0, 1000.0
 
-# Nebular
+# Nebular line width.
 FWHM_KMS = 300.0
-Z_GRID_FOR_TPL = np.array([5e-2, 2e-2, 8e-3, 4e-3, 4e-4, 1e-4, 1e-5, 1e-7, 1e-9], dtype=float)
+
+# Metallicity grid for nebular templates (l₩ine_raw / cont_raw).
+# The final element is a small placeholder representing the dedicated Z=0 template bin.
+Z_FLOOR_NEB = 1e-7
+Z_GRID_FOR_TPL = np.array(
+    [5e-2, 2e-2, 8e-3, 4e-3, 4e-4, 1e-4, 1e-5, 1e-7, 1e-9],
+    dtype=np.float64
+)
+IDX_Z_ZERO_TPL = int(Z_GRID_FOR_TPL.size - 1)
+
+# Te(Z) lookup table.
+# For Z < 1e-7 (or non-finite / non-positive), use the Z=0 row value directly.
+Z_FLOOR_TE = 1e-7
+LOGTE_ZERO = 4.310
+_Z_TE_POS = np.array([5e-2, 2e-2, 8e-3, 4e-3, 4e-4, 1e-4, 1e-5, 1e-7], dtype=np.float64)
+_LOGTE_POS = np.array([3.579, 3.891, 4.059, 4.147, 4.264, 4.290, 4.304, 4.308], dtype=np.float64)
+
+# Pre-sort for interpolation
+__logZ_tab = np.log10(_Z_TE_POS)
+__sort = np.argsort(__logZ_tab)
+__logZ_tab = __logZ_tab[__sort]
+__LOGTE_tab = _LOGTE_POS[__sort]
+
+def Te_from_Zgas(Zgas: float) -> float:
+    """
+    Estimate electron temperature Te [K] from gas metallicity Z (mass fraction)
+    using the requested piecewise rule:
+      - Z < 1e-7 (or non-finite / non-positive): fixed Z=0 row value
+      - Z >= 1e-7: logZ-linear interpolation on positive-Z nodes
+    """
+    z = float(Zgas)
+    if (not np.isfinite(z)) or (z <= 0.0) or (z < Z_FLOOR_TE):
+        return 10.0**float(LOGTE_ZERO)
+
+    z = min(max(z, float(_Z_TE_POS.min())), float(_Z_TE_POS.max()))
+    logZ = math.log10(z)
+    logTe = float(np.interp(logZ, __logZ_tab, __LOGTE_tab))
+    return 10.0**logTe
+
 TAIL_N = 12  # high-λ tail points for extrapolation
 
 # Line-grid spec
 LINE_W_SIGMA     = 5.0   # ±W·σ window
 LINE_P_PER_FWHM  = 8     # samples per FWHM
-
-# Global MIST cube store
-CUBES_DICT = {}
-
-# Thread-local SNAP handles (read-only)
-TLS = threading.local()
 
 # Registered temp files (auto-delete on exit)
 TO_DELETE = set()
@@ -107,26 +188,7 @@ def cleanup_tmp():
                 os.remove(fp)
         except Exception:
             pass
-
 atexit.register(cleanup_tmp)
-
-# =========================
-# Save options (final datasets)
-# =========================
-# Toggle which final datasets to save.
-# Below: only "total_sed" is saved by default.
-SAVE_SETS = {
-    "stellar_sed": False,
-    "nebular_sed": False,
-    "stellar_plus_nebular": False,
-    "stellar_nebular_agn_attenuated": False,
-    "dust_emission_sed": False,
-    "agn_sed": False,
-    "total_sed": True,
-}
-
-def SAVE(name: str) -> bool:
-    return bool(SAVE_SETS.get(name, False))
 
 # =========================
 # 1) Memory / Interp / HDF5 utils
@@ -136,9 +198,7 @@ def bytes_per_array(n_wave, itemsize=8):
 
 def choose_rows_chunk(target_ram_gb, n_wave, arrays_in_block, itemsize=8,
                       safety_gb=8.0, hard_cap=20000, hard_min=64):
-    """Heuristic: rows * n_wave * itemsize * arrays_in_block
-    <= (target_ram_gb - safety_gb) [GB].
-    """
+    """Heuristic: rows * n_wave * itemsize * arrays_in_block <= (target_ram_gb - safety_gb) [GB]."""
     avail = max(target_ram_gb - safety_gb, 1.0) * (1024**3)
     per_row = bytes_per_array(n_wave, itemsize=itemsize) * arrays_in_block
     rows = int(avail // max(per_row, 1))
@@ -155,6 +215,64 @@ def cap_rows_chunk_for_hdf5(n_wave, rows_chunk, dtype=np.float64,
     max_rows = max(1, (max_bytes - 1) // (n_wave * item))
     return int(min(rows_chunk, max_rows))
 
+def iter_row_blocks(n_rows, block_rows):
+    """Yield contiguous [start, end) row blocks."""
+    n_rows = int(n_rows)
+    block_rows = max(1, int(block_rows))
+    for start in range(0, n_rows, block_rows):
+        end = min(n_rows, start + block_rows)
+        yield start, end
+
+def run_parallel_row_blocks(
+    n_rows,
+    block_rows,
+    desc,
+    unit,
+    worker_fn,
+    consume_fn,
+    max_workers=N_THREADS,
+    max_inflight_blocks=MAX_INFLIGHT_BLOCKS,
+):
+    """
+    Run row blocks with bounded in-flight futures.
+
+    worker_fn(start, end) -> result with row range metadata
+    consume_fn(result) writes/consumes worker output
+    """
+    n_rows = int(n_rows)
+    if n_rows <= 0:
+        return
+
+    max_workers = max(1, int(max_workers))
+    max_inflight_blocks = max(1, int(max_inflight_blocks))
+    blocks_iter = iter(iter_row_blocks(n_rows, block_rows))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        pending = set()
+
+        for _ in range(max_inflight_blocks):
+            try:
+                s, e = next(blocks_iter)
+            except StopIteration:
+                break
+            pending.add(ex.submit(worker_fn, s, e))
+
+        with tqdm(total=n_rows, desc=desc, unit=unit) as pbar:
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fu in done:
+                    result = fu.result()
+                    consume_fn(result)
+
+                    start, end = result[0], result[1]
+                    pbar.update(int(end) - int(start))
+
+                    try:
+                        s, e = next(blocks_iter)
+                    except StopIteration:
+                        continue
+                    pending.add(ex.submit(worker_fn, s, e))
+
 def ensure_sorted(x, y):
     """Ensure x is increasing; y is reordered accordingly."""
     if x[0] > x[-1]:
@@ -163,12 +281,7 @@ def ensure_sorted(x, y):
     return x, y
 
 def precompute_interp_map_loglog(src_wave, dst_wave):
-    """Precompute log-log linear interpolation indices and weights.
-
-    - src_wave: strictly increasing
-    - dst_wave: arbitrary positive wavelengths
-    - Out-of-range → weights 0 (so result is 0)
-    """
+    """Precompute log-log linear interpolation indices and weights."""
     src = np.asarray(src_wave, np.float64)
     dst = np.asarray(dst_wave, np.float64)
     assert np.all(np.diff(src) > 0), "src_wave must be increasing."
@@ -254,7 +367,7 @@ def build_adaptive_wave(base_min_A, base_max_A, n_base, lam_lines,
         if b <= a:
             continue
 
-        n_est = int(np.ceil((2.0 * W / 2.355) * p)) + 1  # ≈ 0.85*W*p + 1
+        n_est = int(np.ceil((2.0 * W / 2.355) * p)) + 1
         n_est = max(9, min(200, n_est))
         add_pts.append(np.linspace(a, b, n_est, dtype=np.float64))
 
@@ -353,12 +466,10 @@ def inv_expm1_stable(x):
     mm = ~(ml | ms)
 
     out[ml] = np.exp(-x[ml])
-
     out[mm] = 1.0 / np.expm1(x[mm])
 
     xs = x[ms]
     out[ms] = (1.0 / xs) - 0.5 + (xs / 12.0) - (xs**3) / 720.0
-
     return out
 
 def solve_lambda_c(T, alpha, beta):
@@ -369,7 +480,7 @@ def solve_lambda_c(T, alpha, beta):
         ex = math.exp(x)
         return (3.0 + beta) - (x * ex) / (ex - 1.0) - alpha
 
-    a, b = 1e-3, 50.0
+    a, b = 1.0e-3, 50.0
     for _ in range(80):
         m = 0.5 * (a + b)
         if g(a) * g(m) <= 0:
@@ -382,15 +493,8 @@ def solve_lambda_c(T, alpha, beta):
     return c_cms / nu_c  # [cm]
 
 def _casey_Snu(nu, T, beta, alpha, nu0, nuc):
-    """
-    Casey (2012) S_nu(ν):
-
-    S_nu(ν) = (1 - e^{-(ν/ν0)^β}) * 2hν^3/c^2 * 1/(e^{hν/kT}-1)
-              + N_pl * ν^{-α} * exp[-(ν_c/ν)^2]
-    with N_pl = e * S_nu_MBB(ν_c) * ν_c^{α}.
-    """
+    """Casey (2012) S_nu(ν)"""
     nu = np.asarray(nu, np.float64)
-
     x   = (h_ergs * nu) / (kB * T)
     tau = (nu / nu0)**beta
 
@@ -405,7 +509,6 @@ def _casey_Snu(nu, T, beta, alpha, nu0, nuc):
 
     Npl = math.e * S_mbb_c * (nuc**alpha)
     S_pl = Npl * (nu**(-alpha)) * np.exp(-(nuc / nu)**2)
-
     return S_mbb + S_pl
 
 def casey_Slambda_per_cm(lam_cm, T, beta, alpha, lambda0_um, lam_c_cm):
@@ -435,15 +538,14 @@ def load_mist_cubes(cube_dir):
         z_val = float(m.group(1))
         with h5py.File(fp, "r") as f:
             cubes[z_val] = {
-                "logZ"   : f["logZ"][:].astype(np.float64),
+                "logZ"    : f["logZ"][:].astype(np.float64),
                 "logAge" : f["log_age"][:].astype(np.float64),
-                "wave"   : f["wavelength"][:].astype(np.float64),
-                "sed"    : f["sed"][:].astype(np.float64),   # (n_Z, n_age, n_wave_native)
+                "wave"    : f["wavelength"][:].astype(np.float64),
+                "sed"     : f["sed"][:].astype(np.float64),   # (n_Z, n_age, n_wave_native)
             }
 
     if not cubes:
         raise RuntimeError(f"No MIST cube files found in {cube_dir}")
-
     return dict(sorted(cubes.items(), key=lambda kv: kv[0]))
 
 def load_skirtor_templates(skirtor_dir):
@@ -463,9 +565,9 @@ def load_skirtor_templates(skirtor_dir):
         F_Wm2 = lamF_Wm2 / lam_um
         F_cgs = F_Wm2 * 1e3  # W/m^2 → erg/s/cm^2
 
-        D_ref = 3.085678e25      # 10 Mpc in cm? (kept as in original)
+        D_ref = 3.085678e25
         L_mu  = F_cgs * 4 * np.pi * D_ref**2
-        L_A   = L_mu / 1e4       # per μm → per Å
+        L_A   = L_mu / 1e4        # per μm -> per Å
 
         L_ref = Lsun * 1e11
         lib[ang] = (L_A / L_ref).astype(np.float64)
@@ -475,7 +577,6 @@ def load_skirtor_templates(skirtor_dir):
 
     if not lib:
         raise RuntimeError("SKIRTOR templates not found.")
-
     return np.array(sorted(lib.keys()), dtype=int), lam_A.astype(np.float64), lib
 
 def load_nebular_templates(line_file, cont_file):
@@ -505,7 +606,6 @@ def precompute_neb_line_basis(lam_grid, lam_lines, fwhm_kms):
         x = (lam_grid - ll) / s
         prof = np.exp(-0.5 * x * x)
         prof /= (s * sqrt2pi)  # ∫prof dλ = 1
-
         basis[:, j] = prof.astype(np.float64)
 
     return basis  # sed_lines = basis @ L_lines
@@ -517,38 +617,57 @@ def precompute_cont_tail_slope_per_iz(lam_cont, cont_raw, tail_n=12):
 
     for iz in range(cont_raw.shape[1] - 1):  # first col = λ, then each iz
         Lnu_perQ = cont_raw[:, 1 + iz].astype(np.float64)
-
-        # L_lambda per Q_H=1
-        Flam1 = Lnu_perQ * (c_cms * 1e8) / (lam**2)
+        Flam1 = Lnu_perQ * (c_cms * 1e8) / (lam**2)  # L_lambda per Q_H=1
 
         k = int(min(max(tail_n, 2), len(lam)))
         xt = np.log(lam[-k:])
         yt = np.log(np.clip(Flam1[-k:], 1e-300, None))
 
-        m, b = np.polyfit(xt, yt, 1)
+        m, _ = np.polyfit(xt, yt, 1)
         slopes.append(m)
 
     return np.array(slopes, dtype=np.float64)  # (n_iz,)
 
 # =========================
-# 6) TLS SNAP handles
+# 6) Runtime data preload
 # =========================
-def get_tls_handles():
-    """Thread-local SNAP file handles (read-only)."""
-    if getattr(TLS, "snap", None) is None:
-        f = h5py.File(SNAP, "r")
-        TLS.snap = f
-        TLS.pt4_mass = f["PartType4/Masses"]
-        TLS.pt4_aform = f["PartType4/StellarFormationTime"]
-        TLS.pt4_Z    = f["PartType4/Metallicity"]
-        TLS.pt5_mdot = f["PartType5/BlackHoleMassAccretionRate"]
-    return TLS
+def preload_runtime_inputs(snap_path, fof_path):
+    """
+    Load frequently accessed FOF/SNAPSHOT arrays into RAM once.
+    This avoids repeated HDF5 random reads during Stage A/B workers.
+    """
+    print("Preloading FOF/SNAPSHOT arrays into RAM ...")
+
+    with h5py.File(fof_path, "r") as f:
+        fof_mem = {
+            "sub_mtype4": f["Subhalo/SubhaloMassType"][:, 4].astype(np.float64),
+            "zgas_sfr": f["Subhalo/SubhaloMetallicitySFR"][:].astype(np.float64),
+            "zgas_instar": f["Subhalo/SubhaloGasMetallicityInStarRad"][:].astype(np.float64),
+            "off_star": f["Subhalo/SubhaloOffsetType"][:, 4].astype(np.int64),
+            "len_star": f["Subhalo/SubhaloLenType"][:, 4].astype(np.int64),
+            "off_bh": f["Subhalo/SubhaloOffsetType"][:, 5].astype(np.int64),
+            "len_bh": f["Subhalo/SubhaloLenType"][:, 5].astype(np.int64),
+            "spin": f["Subhalo/SubhaloSpin"][:].astype(np.float64),
+        }
+
+    with h5py.File(snap_path, "r") as f:
+        mdot_ds = f["PartType5/BlackHoleMassAccretionRate"]
+        snap_mem = {
+            "a_now": float(f["Header"].attrs["Time"]),
+            "pt4_mass": f["PartType4/Masses"][:].astype(np.float64),
+            "pt4_aform": f["PartType4/StellarFormationTime"][:].astype(np.float64),
+            "pt4_Z": f["PartType4/Metallicity"][:].astype(np.float64),
+            "pt5_mdot": mdot_ds[:].astype(np.float64),
+            "pt5_mdot_to_cgs": float(mdot_ds.attrs.get("to_cgs", 1.0)),
+        }
+
+    return snap_mem, fof_mem
 
 # =========================
-# Stage A: Stellar (ADAPT), Q_H, Z_abs
+# Stage A: Stellar (ADAPT), Q_H
 # =========================
 def stage_stellar(eligible_sids, cubes, z_keys, a_now,
-                  out_path, rows_chunk=None):
+                  out_path, fof_mem, snap_mem, rows_chunk=None):
     register_tmp(out_path)
 
     N_sel  = len(eligible_sids)
@@ -558,30 +677,40 @@ def stage_stellar(eligible_sids, cubes, z_keys, a_now,
         rows_chunk = choose_rows_chunk(
             TARGET_RAM_GB * 0.15,
             N_wave,
-            arrays_in_block=2,
+            arrays_in_block=2,   # stellar + maybe scratch
             itemsize=8,
             safety_gb=2.0,
             hard_cap=20000,
         )
-    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk,
-                                         dtype=np.float64)
+    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk, dtype=np.float64)
     rows_chunk = min(rows_chunk, N_sel)
+    task_rows = max(1, min(rows_chunk, BLOCK_ROWS_STAGE_A))
 
-    with h5py.File(FOF, "r") as f_fof, \
-         h5py.File(out_path, "w",
+    z_keys = np.asarray(z_keys, dtype=np.float64)
+    if z_keys.ndim != 1 or z_keys.size == 0:
+        raise ValueError("z_keys must be a non-empty 1D array")
+    if np.any(np.diff(z_keys) < 0):
+        raise ValueError("z_keys must be sorted in ascending order")
+
+    # O(log N) nearest-redshift binning for sorted z_keys.
+    z_mid = 0.5 * (z_keys[:-1] + z_keys[1:]) if z_keys.size > 1 else np.empty((0,), dtype=np.float64)
+    cube_by_k = [cubes[float(z)] for z in z_keys]
+    interp_map_by_k = [precompute_interp_map_loglog(cb["wave"], ADAPT_WAVE) for cb in cube_by_k]
+    t_now = float(cosmic_time_from_a(a_now))
+
+    off_star = fof_mem["off_star"]
+    len_star = fof_mem["len_star"]
+    pt4_mass = snap_mem["pt4_mass"]
+    pt4_aform = snap_mem["pt4_aform"]
+    pt4_Z = snap_mem["pt4_Z"]
+
+    with h5py.File(out_path, "w",
                    libver="latest",
                    rdcc_nbytes=(1 << 28),
                    rdcc_nslots=(1 << 20)) as f_out:
 
-        off_star = f_fof["Subhalo/SubhaloOffsetType"][:, 4].astype(np.int64)
-        len_star = f_fof["Subhalo/SubhaloLenType"][:, 4].astype(np.int64)
-
-        f_out.create_dataset("wavelength_adapt",
-                             data=ADAPT_WAVE,
-                             dtype="f8")
-        f_out.create_dataset("subhalo_ids",
-                             data=eligible_sids.astype(np.int32),
-                             dtype="i4")
+        f_out.create_dataset("wavelength_adapt", data=ADAPT_WAVE, dtype="f8")
+        f_out.create_dataset("subhalo_ids", data=eligible_sids.astype(np.int32), dtype="i4")
 
         d_stellar = f_out.create_dataset(
             "stellar",
@@ -589,123 +718,91 @@ def stage_stellar(eligible_sids, cubes, z_keys, a_now,
             dtype="f8",
             chunks=(rows_chunk, N_wave),
         )
-        d_QH  = f_out.create_dataset("Q_H",
-                                     shape=(N_sel,),
-                                     dtype="f8")
-        d_Zmw = f_out.create_dataset("Z_abs_mw",
-                                     shape=(N_sel,),
-                                     dtype="f8")
+        d_QH = f_out.create_dataset("Q_H", shape=(N_sel,), dtype="f8")
 
-        # precompute interp map per z-cube
-        interp_map_per_z = {}
+        def work_block(start, end):
+            n_block = end - start
+            stellar_block = np.zeros((n_block, N_wave), dtype=np.float64)
+            qh_block = np.zeros((n_block,), dtype=np.float64)
 
-        def work(row_idx, sid):
-            tls = get_tls_handles()
-            b = int(off_star[sid])
-            e = int(off_star[sid] + len_star[sid])
+            for bi, sid in enumerate(eligible_sids[start:end]):
+                sid = int(sid)
+                b = int(off_star[sid])
+                e = int(off_star[sid] + len_star[sid])
 
-            spec_adapt_sum = np.zeros_like(ADAPT_WAVE, dtype=np.float64)
-            Z_abs_mw = 0.002
+                spec_adapt_sum = np.zeros(N_wave, dtype=np.float64)
 
-            if e > b:
-                m_star_sim = tls.pt4_mass[b:e].astype(np.float64)
-                a_form     = tls.pt4_aform[b:e].astype(np.float64)
-                Z_abs_star = tls.pt4_Z[b:e].astype(np.float64)
+                if e > b:
+                    m_star_sim = pt4_mass[b:e]
+                    a_form = pt4_aform[b:e]
+                    Z_abs_star = pt4_Z[b:e]
 
-                m_physical = (m_star_sim * MASS_CONV)
-                if np.any(m_physical > 0):
-                    Z_abs_mw = float(
-                        np.average(Z_abs_star, weights=m_physical)
-                    )
+                    m_physical = m_star_sim * MASS_CONV
+                    t_form = cosmic_time_from_a(a_form)
+                    ages_s = np.maximum((t_now - t_form) * 1e9, 1e-5)
+                    logA = np.log10(ages_s)
+                    logZZ = np.log10(np.clip(Z_abs_star / Z_sun, 1e-6, None))
 
-                t_now  = cosmic_time_from_a(a_now)
-                t_form = cosmic_time_from_a(a_form)
-                ages_s = np.maximum((t_now - t_form) * 1e9, 1e-5)
-                logA   = np.log10(ages_s)
-                logZZ  = np.log10(
-                    np.clip(Z_abs_star / Z_sun, 1e-6, None)
-                )
+                    z_form = (1.0 / np.asarray(a_form)) - 1.0
+                    if z_mid.size:
+                        z_pick_idx = np.searchsorted(z_mid, z_form, side="left").astype(np.int32)
+                    else:
+                        z_pick_idx = np.zeros(z_form.shape[0], dtype=np.int32)
 
-                z_form = (1.0 / np.asarray(a_form)) - 1.0
-                z_pick_idx = np.argmin(
-                    np.abs(z_keys[None, :] - z_form[:, None]),
-                    axis=1,
-                ).astype(np.int32)
+                    for k in np.unique(z_pick_idx):
+                        sel = (z_pick_idx == k)
+                        cube = cube_by_k[int(k)]
 
-                for k in np.unique(z_pick_idx):
-                    sel = (z_pick_idx == k)
-                    cube = CUBES_DICT[float(z_keys[k])]
+                        iZ = np.searchsorted(cube["logZ"], logZZ[sel]).clip(
+                            0, cube["logZ"].size - 1
+                        )
+                        iA = np.searchsorted(cube["logAge"], logA[sel]).clip(
+                            0, cube["logAge"].size - 1
+                        )
+                        w = m_physical[sel]
 
-                    iZ = np.searchsorted(cube["logZ"], logZZ[sel]).clip(
-                        0, cube["logZ"].size - 1
-                    )
-                    iA = np.searchsorted(cube["logAge"], logA[sel]).clip(
-                        0, cube["logAge"].size - 1
-                    )
-                    w  = m_physical[sel]
+                        nA = cube["logAge"].size
+                        key = (iZ.astype(np.int64) * nA) + iA.astype(np.int64)
+                        uniq, inv = np.unique(key, return_inverse=True)
 
-                    nA = cube["logAge"].size
-                    key = (iZ.astype(np.int64) * nA) + iA.astype(np.int64)
-                    uniq, inv = np.unique(key, return_inverse=True)
+                        wsum = np.zeros(uniq.size, dtype=np.float64)
+                        np.add.at(wsum, inv, w)
 
-                    wsum = np.zeros(uniq.size, dtype=np.float64)
-                    np.add.at(wsum, inv, w)
+                        uniq_iZ = (uniq // nA).astype(np.int32)
+                        uniq_iA = (uniq % nA).astype(np.int32)
 
-                    uniq_iZ = (uniq // nA).astype(np.int32)
-                    uniq_iA = (uniq %  nA).astype(np.int32)
+                        seds_nat = cube["sed"][uniq_iZ, uniq_iA].astype(np.float64, copy=False)
+                        idxlo, idxhi, wlo, whi, left_mask, right_mask, _ = interp_map_by_k[int(k)]
 
-                    seds_nat = cube["sed"][uniq_iZ, uniq_iA].astype(
-                        np.float64,
-                        copy=False,
-                    )   # (U, N_wave_native)
+                        spec_native = np.einsum("ij,i->j", seds_nat, wsum, optimize=True)
+                        spec_adapt = (spec_native[idxlo] * wlo) + (spec_native[idxhi] * whi)
+                        spec_adapt[left_mask | right_mask] = 0.0
+                        spec_adapt_sum += spec_adapt
 
-                    key_map = id(cube["wave"])
-                    if key_map not in interp_map_per_z:
-                        interp_map_per_z[key_map] = \
-                            precompute_interp_map_loglog(
-                                cube["wave"], ADAPT_WAVE
-                            )
+                stellar_block[bi, :] = spec_adapt_sum
+                qh_block[bi] = compute_QH(ADAPT_WAVE, spec_adapt_sum)
 
-                    idxlo, idxhi, wlo, whi, left_mask, right_mask, _ = \
-                        interp_map_per_z[key_map]
+            return start, end, stellar_block, qh_block
 
-                    spec_native = np.einsum(
-                        "ij,i->j",
-                        seds_nat,
-                        wsum,
-                        optimize=True,
-                    )   # (N_wave_native,)
+        def consume_block(result):
+            start, end, stellar_block, qh_block = result
+            d_stellar[start:end, :] = stellar_block
+            d_QH[start:end] = qh_block
 
-                    spec_adapt = (spec_native[idxlo] * wlo) + \
-                                 (spec_native[idxhi] * whi)
-                    spec_adapt[left_mask | right_mask] = 0.0
-
-                    spec_adapt_sum += spec_adapt
-
-            QH = compute_QH(ADAPT_WAVE, spec_adapt_sum)
-            return row_idx, spec_adapt_sum, QH, Z_abs_mw
-
-        with ThreadPoolExecutor(max_workers=N_THREADS) as ex:
-            pbar = tqdm(total=N_sel,
-                        desc="Stage A: Stellar",
-                        unit="sid")
-            futures = [
-                ex.submit(work, i, int(sid))
-                for i, sid in enumerate(eligible_sids)
-            ]
-            for fu in as_completed(futures):
-                i, stellar, qh, zmw = fu.result()
-                d_stellar[i, :] = stellar
-                d_QH[i]  = qh
-                d_Zmw[i] = zmw
-                pbar.update(1)
-            pbar.close()
+        run_parallel_row_blocks(
+            n_rows=N_sel,
+            block_rows=task_rows,
+            desc="Stage A: Stellar",
+            unit="sid",
+            worker_fn=work_block,
+            consume_fn=consume_block,
+        )
 
 # =========================
 # Stage B: AGN (ADAPT)
 # =========================
 def stage_agn(eligible_sids, angles, lam_agn, skirtor_lib,
-              out_path, rows_chunk=None):
+              out_path, fof_mem, snap_mem, rows_chunk=None):
     register_tmp(out_path)
 
     N_sel  = len(eligible_sids)
@@ -720,62 +817,22 @@ def stage_agn(eligible_sids, angles, lam_agn, skirtor_lib,
             safety_gb=1.0,
             hard_cap=20000,
         )
-    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk,
-                                         dtype=np.float64)
+    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk, dtype=np.float64)
     rows_chunk = min(rows_chunk, N_sel)
+    task_rows = max(1, min(rows_chunk, BLOCK_ROWS_STAGE_B))
 
-    with h5py.File(FOF, "r") as f:
-        off_bh = f["Subhalo/SubhaloOffsetType"][:, 5].astype(np.int64)
-        len_bh = f["Subhalo/SubhaloLenType"][:, 5].astype(np.int64)
-        spin   = f["Subhalo/SubhaloSpin"][:].astype(np.float64)
-
-    with h5py.File(SNAP, "r") as f:
-        to_cgs = float(
-            f["PartType5/BlackHoleMassAccretionRate"].attrs.get(
-                "to_cgs", 1.0
-            )
-        )
-
-    def work(row_idx, sid):
-        tls = get_tls_handles()
-        jb = int(off_bh[sid])
-        je = int(off_bh[sid] + len_bh[sid])
-
-        if je <= jb:
-            return row_idx, np.zeros_like(ADAPT_WAVE, dtype=np.float64)
-
-        mdot = tls.pt5_mdot[jb:je].astype(np.float64) * to_cgs
-        Lbol = 0.10 * mdot * c_cms**2
-        Ltot = float(np.sum(Lbol))
-
-        if Ltot <= 0:
-            return row_idx, np.zeros_like(ADAPT_WAVE, dtype=np.float64)
-
-        j  = spin[sid]
-        jn = np.linalg.norm(j)
-        if jn > 0:
-            inc = np.degrees(
-                np.arccos(np.clip(j[2] / jn, -1, 1))
-            )
-        else:
-            inc = 0.0
-
-        ang = angles[np.argmin(np.abs(angles - inc))]
-        sedA = skirtor_lib[ang] * Ltot
-
-        agn = interp_loglog_to_grid(lam_agn, sedA, ADAPT_WAVE)
-        return row_idx, agn
+    off_bh = fof_mem["off_bh"]
+    len_bh = fof_mem["len_bh"]
+    spin = fof_mem["spin"]
+    pt5_mdot = snap_mem["pt5_mdot"]
+    to_cgs = float(snap_mem["pt5_mdot_to_cgs"])
 
     with h5py.File(out_path, "w",
                    libver="latest",
                    rdcc_nbytes=(1 << 27),
                    rdcc_nslots=(1 << 20)) as f_out:
-        f_out.create_dataset("wavelength_adapt",
-                             data=ADAPT_WAVE,
-                             dtype="f8")
-        f_out.create_dataset("subhalo_ids",
-                             data=eligible_sids.astype(np.int32),
-                             dtype="i4")
+        f_out.create_dataset("wavelength_adapt", data=ADAPT_WAVE, dtype="f8")
+        f_out.create_dataset("subhalo_ids", data=eligible_sids.astype(np.int32), dtype="i4")
 
         d_agn = f_out.create_dataset(
             "agn",
@@ -784,27 +841,55 @@ def stage_agn(eligible_sids, angles, lam_agn, skirtor_lib,
             chunks=(rows_chunk, N_wave),
         )
 
-        with ThreadPoolExecutor(max_workers=N_THREADS) as ex:
-            pbar = tqdm(total=N_sel,
-                        desc="Stage B: AGN",
-                        unit="sid")
-            futures = [
-                ex.submit(work, i, int(sid))
-                for i, sid in enumerate(eligible_sids)
-            ]
-            for fu in as_completed(futures):
-                i, agn = fu.result()
-                d_agn[i, :] = agn
-                pbar.update(1)
-            pbar.close()
+        def work_block(start, end):
+            n_block = end - start
+            agn_block = np.zeros((n_block, N_wave), dtype=np.float64)
+
+            for bi, sid in enumerate(eligible_sids[start:end]):
+                sid = int(sid)
+                jb = int(off_bh[sid])
+                je = int(off_bh[sid] + len_bh[sid])
+                if je <= jb:
+                    continue
+
+                mdot = pt5_mdot[jb:je] * to_cgs
+                Lbol = 0.10 * mdot * c_cms**2
+                Ltot = float(np.sum(Lbol))
+                if Ltot <= 0:
+                    continue
+
+                j = spin[sid]
+                jn = np.linalg.norm(j)
+                if jn > 0:
+                    inc = np.degrees(np.arccos(np.clip(j[2] / jn, -1, 1)))
+                else:
+                    inc = 0.0
+
+                ang = angles[np.argmin(np.abs(angles - inc))]
+                sedA = skirtor_lib[ang] * Ltot
+                agn_block[bi, :] = interp_loglog_to_grid(lam_agn, sedA, ADAPT_WAVE)
+
+            return start, end, agn_block
+
+        def consume_block(result):
+            start, end, agn_block = result
+            d_agn[start:end, :] = agn_block
+
+        run_parallel_row_blocks(
+            n_rows=N_sel,
+            block_rows=task_rows,
+            desc="Stage B: AGN",
+            unit="sid",
+            worker_fn=work_block,
+            consume_fn=consume_block,
+        )
 
 # =========================
-# Stage C: Nebular (ADAPT)
+# Stage C: Nebular (ADAPT) using Z_gas and Te(Z_gas)
 # =========================
 def stage_nebular(eligible_sids, line_raw, cont_raw,
-                  stellar_tmp, out_path, rows_chunk=None):
+                  stellar_tmp, out_path, Z_gas_sel, rows_chunk=None):
     register_tmp(out_path)
-
     assert ADAPT_WAVE is not None
 
     N_sel  = len(eligible_sids)
@@ -819,79 +904,155 @@ def stage_nebular(eligible_sids, line_raw, cont_raw,
             safety_gb=2.0,
             hard_cap=20000,
         )
-    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk,
-                                         dtype=np.float64)
+    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk, dtype=np.float64)
     rows_chunk = min(rows_chunk, N_sel)
+    task_rows = max(1, min(rows_chunk, BLOCK_ROWS_STAGE_C))
 
     with h5py.File(stellar_tmp, "r") as fs:
-        QH_array  = fs["Q_H"][:].astype(np.float64)
-        Zmw_array = fs["Z_abs_mw"][:].astype(np.float64)
+        QH_array = fs["Q_H"][:].astype(np.float64)
 
-    lam_line  = line_raw[:, 1].astype(np.float64)
-    neb_basis = precompute_neb_line_basis(ADAPT_WAVE, lam_line,
-                                          FWHM_KMS)  # (N_wave, N_lines)
+    Z_gas_sel = np.asarray(Z_gas_sel, dtype=np.float64)
+    if Z_gas_sel.shape[0] != N_sel:
+        raise ValueError("Z_gas_sel must have length == number of eligible subhaloes")
+
+    lam_line = line_raw[:, 1].astype(np.float64)
+    neb_basis = precompute_neb_line_basis(ADAPT_WAVE, lam_line, FWHM_KMS)
 
     lam_cont = cont_raw[:, 0].astype(np.float64)
     idxlo_c, idxhi_c, wlo_c, whi_c, left_mask_c, right_mask_c, _ = \
         precompute_interp_map_loglog(lam_cont, ADAPT_WAVE)
-    tail_slopes = precompute_cont_tail_slope_per_iz(
-        lam_cont, cont_raw, tail_n=TAIL_N
-    )
+    has_right_tail = bool(np.any(right_mask_c))
+    cont_to_lam = (c_cms * 1e8) / (lam_cont**2)
 
-    xmax    = lam_cont[-1]
+    tail_slopes = precompute_cont_tail_slope_per_iz(lam_cont, cont_raw, tail_n=TAIL_N)
+    tail_slopes = np.asarray(tail_slopes, dtype=np.float64)
+    xmax = lam_cont[-1]
     log_dst = np.log(ADAPT_WAVE.astype(np.float64))
 
-    def sed_cont_with_tail(iz, Flam_native):
-        inside = (Flam_native[idxlo_c] * wlo_c) + \
-                 (Flam_native[idxhi_c] * whi_c)
+    nZ = int(Z_GRID_FOR_TPL.size)
+    if cont_raw.shape[1] < (1 + nZ):
+        raise ValueError("Nebular continuum template columns do not match Z_GRID_FOR_TPL length.")
+    max_ratio_col = 2 + 2 * (nZ - 1)
+    if line_raw.shape[1] <= max_ratio_col:
+        raise ValueError("Nebular line template columns do not match Z_GRID_FOR_TPL length.")
+    if tail_slopes.size < nZ:
+        raise ValueError("Tail-slope vector is shorter than the nebular metallicity grid.")
+
+    line_ratio_by_z = np.stack(
+        [line_raw[:, 2 + 2 * iz].astype(np.float64) for iz in range(nZ)],
+        axis=1,
+    )  # (N_lines, nZ)
+    cont_lnu_perQ_by_z = np.stack(
+        [cont_raw[:, 1 + iz].astype(np.float64) for iz in range(nZ)],
+        axis=1,
+    )  # (N_cont, nZ)
+    tail_slopes = tail_slopes[:nZ]
+
+    pos_mask = (Z_GRID_FOR_TPL >= Z_FLOOR_NEB)
+    pos_idx = np.nonzero(pos_mask)[0].astype(np.int32)
+    if pos_idx.size < 2:
+        raise ValueError("Need at least two positive-Z nodes (>= Z_FLOOR_NEB) for logZ interpolation.")
+    logZ_pos = np.log10(Z_GRID_FOR_TPL[pos_idx].astype(np.float64))
+    order = np.argsort(logZ_pos)
+    pos_idx = pos_idx[order]
+    logZ_pos = logZ_pos[order]
+    if np.any(np.diff(logZ_pos) <= 0.0):
+        raise ValueError("Positive-Z metallicity nodes must be strictly increasing in logZ.")
+
+    def sed_cont_with_tail(Flam_native, m_tail):
+        inside = (Flam_native[idxlo_c] * wlo_c) + (Flam_native[idxhi_c] * whi_c)
         out = inside.copy()
 
-        if np.any(right_mask_c):
-            m = float(tail_slopes[iz])
+        if has_right_tail:
+            m = float(m_tail)
             y_at_xmax = float(Flam_native[-1])
             b = np.log(max(y_at_xmax, 1e-300)) - m * np.log(xmax)
-            out[right_mask_c] = np.exp(
-                m * log_dst[right_mask_c] + b
-            )
+            out[right_mask_c] = np.exp(m * log_dst[right_mask_c] + b)
 
         out[left_mask_c] = 0.0
         out[~np.isfinite(out)] = 0.0
         out[out < 0] = 0.0
         return out
 
-    def work(row_idx):
-        QH = float(QH_array[row_idx])
-        if QH <= 0.0:
-            return row_idx, np.zeros(N_wave, dtype=np.float64)
+    def metallicity_interp_weights_logZ(Zgas):
+        """
+        Return (iz_lo, iz_hi, w_lo, w_hi, Z_out) for nebular-template interpolation.
+        For Z < 1e-7 (or non-finite / non-positive), use the dedicated Z=0 bin directly.
+        """
+        z = float(Zgas)
+        if (not np.isfinite(z)) or (z <= 0.0) or (z < Z_FLOOR_NEB):
+            return IDX_Z_ZERO_TPL, IDX_Z_ZERO_TPL, 1.0, 0.0, 0.0
 
-        Zmw = float(Zmw_array[row_idx])
-        iz  = int(np.abs(Zmw - Z_GRID_FOR_TPL).argmin())
-        ratio_col = 2 + 2 * iz
+        z = min(max(z, float(Z_FLOOR_NEB)), float(Z_GRID_FOR_TPL.max()))
+        logz = math.log10(z)
 
-        # Line emission
-        L_Hb = (gamma_Hbeta(14200.0) / alpha_B(14200.0)) * QH
-        L_lines = (
-            line_raw[:, ratio_col].astype(np.float64) * L_Hb
-        )  # (N_lines,)
-        sed_lines = (neb_basis @ L_lines)  # (N_wave,)
+        hi = int(np.searchsorted(logZ_pos, logz, side="left"))
+        hi = min(max(hi, 1), logZ_pos.size - 1)
+        lo = hi - 1
 
-        # Continuum (per QH template scaled by QH)
-        Lnu = cont_raw[:, 1 + iz].astype(np.float64) * QH
-        Flam_native = Lnu * (c_cms * 1e8) / (lam_cont**2)
-        sed_cont = sed_cont_with_tail(iz, Flam_native)
+        x0 = float(logZ_pos[lo])
+        x1 = float(logZ_pos[hi])
+        if (not np.isfinite(x0)) or (not np.isfinite(x1)) or (x1 <= x0):
+            iz = int(pos_idx[lo])
+            return iz, iz, 1.0, 0.0, z
 
-        return row_idx, (sed_lines + sed_cont).astype(np.float64)
+        w_hi = float(np.clip((logz - x0) / (x1 - x0), 0.0, 1.0))
+        w_lo = 1.0 - w_hi
+        return int(pos_idx[lo]), int(pos_idx[hi]), w_lo, w_hi, z
+
+    def work_block(start, end):
+        n_block = end - start
+        neb_block = np.zeros((n_block, N_wave), dtype=np.float64)
+
+        for bi, row_idx in enumerate(range(start, end)):
+            QH = float(QH_array[row_idx])
+            if QH <= 0.0:
+                continue
+
+            Zgas_in = float(Z_gas_sel[row_idx])
+            iz_lo, iz_hi, w_lo, w_hi, Zgas = metallicity_interp_weights_logZ(Zgas_in)
+
+            # Te uses the piecewise Te_from_Zgas rule (fixed floor below Z<1e-7).
+            Te = Te_from_Zgas(Zgas)
+
+            # Line emission: QH -> L(Hbeta) uses Te
+            L_Hb = (gamma_Hbeta(Te) / alpha_B(Te)) * QH
+
+            # Interpolate line ratios in logZ (template values linearly combined).
+            ratios = (
+                line_ratio_by_z[:, iz_lo] * w_lo
+                + line_ratio_by_z[:, iz_hi] * w_hi
+            )
+            ratios[~np.isfinite(ratios)] = 0.0
+            ratios = np.clip(ratios, 0.0, None)
+            L_lines = ratios * L_Hb
+            sed_lines = (neb_basis @ L_lines)  # (N_wave,)
+
+            # Interpolate continuum in logZ (template values linearly combined), then scale by QH.
+            Lnu_perQ = (
+                cont_lnu_perQ_by_z[:, iz_lo] * w_lo
+                + cont_lnu_perQ_by_z[:, iz_hi] * w_hi
+            )
+            Lnu_perQ[~np.isfinite(Lnu_perQ)] = 0.0
+            Lnu_perQ = np.clip(Lnu_perQ, 0.0, None)
+            Flam_native = (Lnu_perQ * QH) * cont_to_lam
+
+            m_tail = (
+                float(tail_slopes[iz_lo]) * w_lo
+                + float(tail_slopes[iz_hi]) * w_hi
+            )
+            sed_cont = sed_cont_with_tail(Flam_native, m_tail)
+
+            neb_block[bi, :] = (sed_lines + sed_cont).astype(np.float64)
+
+        return start, end, neb_block
 
     with h5py.File(out_path, "w",
                    libver="latest",
                    rdcc_nbytes=(1 << 27),
                    rdcc_nslots=(1 << 20)) as f_out:
-        f_out.create_dataset("wavelength_adapt",
-                             data=ADAPT_WAVE,
-                             dtype="f8")
-        f_out.create_dataset("subhalo_ids",
-                             data=eligible_sids.astype(np.int32),
-                             dtype="i4")
+        f_out.create_dataset("wavelength_adapt", data=ADAPT_WAVE, dtype="f8")
+        f_out.create_dataset("subhalo_ids", data=eligible_sids.astype(np.int32), dtype="i4")
 
         d_neb = f_out.create_dataset(
             "nebular",
@@ -900,22 +1061,21 @@ def stage_nebular(eligible_sids, line_raw, cont_raw,
             chunks=(rows_chunk, N_wave),
         )
 
-        with ThreadPoolExecutor(max_workers=N_THREADS) as ex:
-            pbar = tqdm(total=N_sel,
-                        desc="Stage C: Nebular",
-                        unit="sid")
-            futures = [ex.submit(work, i) for i in range(N_sel)]
-            for fu in as_completed(futures):
-                i, neb = fu.result()
-                d_neb[i, :] = neb
-                pbar.update(1)
-            pbar.close()
+        def consume_block(result):
+            start, end, neb_block = result
+            d_neb[start:end, :] = neb_block
 
-# =========================
-# Stage D: Merge to final (ADAPT) + selective save + cleanup
-# =========================
+        run_parallel_row_blocks(
+            n_rows=N_sel,
+            block_rows=task_rows,
+            desc="Stage C: Nebular",
+            unit="sid",
+            worker_fn=work_block,
+            consume_fn=consume_block,
+        )
+
 def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
-                            out_final, a_now, rows_chunk=None):
+                            out_final, a_now, E_B_V_snapshot, rows_chunk=None):
     assert ADAPT_WAVE is not None
 
     N_sel  = len(eligible_sids)
@@ -930,9 +1090,12 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
             safety_gb=10.0,
             hard_cap=15000,
         )
-    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk,
-                                         dtype=np.float64)
+    rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk, dtype=np.float64)
     rows_chunk = min(rows_chunk, N_sel)
+
+    # Snapshot redshift & E(B-V)
+    z_snapshot = (1.0 / a_now) - 1.0
+    E_B_V = float(E_B_V_snapshot)
 
     # Precompute attenuation transmission and masks
     lam_um = ADAPT_WAVE.astype(np.float64) * 1e-4
@@ -941,7 +1104,6 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
     mask_ion = (ADAPT_WAVE <= 912.0)
 
     # Casey shape (row-invariant)
-    T_dust = 40.0
     lam_norm_um = np.geomspace(IR_MIN_UM, IR_MAX_UM, 2000)
     lam_norm_cm = lam_norm_um * 1e-4
     lam_c_cm    = solve_lambda_c(T_dust, CASEY_ALPHA, CASEY_BETA)
@@ -982,12 +1144,8 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
                    libver="latest",
                    rdcc_nbytes=(1 << 29),
                    rdcc_nslots=(1 << 20)) as f_out:
-        f_out.create_dataset("wavelength",
-                             data=ADAPT_WAVE,
-                             dtype="f8")
-        f_out.create_dataset("subhalo_ids",
-                             data=eligible_sids.astype(np.int32),
-                             dtype="i4")
+        f_out.create_dataset("wavelength", data=ADAPT_WAVE, dtype="f8")
+        f_out.create_dataset("subhalo_ids", data=eligible_sids.astype(np.int32), dtype="i4")
 
         filters_final = dict(
             compression="gzip",
@@ -995,12 +1153,10 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
             shuffle=True,
         )
 
-        rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk,
-                                             dtype=np.float64)
+        rows_chunk = cap_rows_chunk_for_hdf5(N_wave, rows_chunk, dtype=np.float64)
 
         # Create only requested datasets
         d_out = {}
-
         def maybe_create(name):
             if SAVE(name):
                 d_out[name] = f_out.create_dataset(
@@ -1021,22 +1177,14 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
         maybe_create("agn_sed")
         maybe_create("total_sed")
 
-        pbar = tqdm(total=N_sel,
-                    desc="Stage D: Merge",
-                    unit="sid")
+        pbar = tqdm(total=N_sel, desc="Stage D: Merge", unit="sid")
 
         for start in range(0, N_sel, rows_chunk):
             end = min(N_sel, start + rows_chunk)
 
-            st_block = stellar_ad[start:end, :].astype(
-                np.float64, copy=False
-            )
-            ag_block = agn_ad[start:end, :].astype(
-                np.float64, copy=False
-            )
-            nb_block = neb_ad[start:end, :].astype(
-                np.float64, copy=False
-            )
+            st_block = stellar_ad[start:end, :].astype(np.float64, copy=False)
+            ag_block = agn_ad[start:end, :].astype(np.float64, copy=False)
+            nb_block = neb_ad[start:end, :].astype(np.float64, copy=False)
 
             if d_out["stellar_sed"] is not None:
                 d_out["stellar_sed"][start:end, :] = st_block
@@ -1047,12 +1195,7 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
 
             need_spn = any(
                 d_out[k] is not None
-                for k in (
-                    "stellar_plus_nebular",
-                    "stellar_nebular_agn_attenuated",
-                    "dust_emission_sed",
-                    "total_sed",
-                )
+                for k in ("stellar_plus_nebular", "stellar_nebular_agn_attenuated", "dust_emission_sed", "total_sed")
             )
             if need_spn:
                 spn = st_block + nb_block
@@ -1063,23 +1206,15 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
 
             need_atten = any(
                 d_out[k] is not None
-                for k in (
-                    "stellar_nebular_agn_attenuated",
-                    "dust_emission_sed",
-                    "total_sed",
-                )
+                for k in ("stellar_nebular_agn_attenuated", "dust_emission_sed", "total_sed")
             )
             if need_atten:
-                spnag = (
-                    (spn if spn is not None else (st_block + nb_block))
-                    + ag_block
-                )
+                spnag = ((spn if spn is not None else (st_block + nb_block)) + ag_block)
                 atten_all = spnag * trans
                 atten_all[:, mask_ion] = 0.0
 
                 if d_out["stellar_nebular_agn_attenuated"] is not None:
-                    d_out["stellar_nebular_agn_attenuated"][start:end, :] = \
-                        atten_all
+                    d_out["stellar_nebular_agn_attenuated"][start:end, :] = atten_all
             else:
                 spnag = None
                 atten_all = None
@@ -1091,28 +1226,18 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
             if need_dust:
                 if np.any(mask_abs):
                     lam_abs = ADAPT_WAVE[mask_abs].astype(np.float64)
-                    base_for_abs = (
-                        spnag
-                        if spnag is not None
-                        else (st_block + nb_block + ag_block)
-                    )
-                    diff_abs = np.clip(
-                        base_for_abs[:, mask_abs] - atten_all[:, mask_abs],
-                        0.0,
-                        None,
-                    )
+                    base_for_abs = spnag if spnag is not None else (st_block + nb_block + ag_block)
+
+                    diff_abs = np.clip(base_for_abs[:, mask_abs] - atten_all[:, mask_abs], 0.0, None)
                     L_abs = np.trapz(diff_abs, lam_abs, axis=1)
                 else:
-                    L_abs = np.zeros((end - start,),
-                                     dtype=np.float64)
+                    L_abs = np.zeros((end - start,), dtype=np.float64)
 
                 if area > 0:
-                    dust = (L_abs[:, None] / area) * \
-                           casey_shape_perA[None, :]
+                    dust = (L_abs[:, None] / area) * casey_shape_perA[None, :]
                     dust[~np.isfinite(dust)] = 0.0
                 else:
-                    dust = np.zeros_like(atten_all,
-                                         dtype=np.float64)
+                    dust = np.zeros_like(atten_all, dtype=np.float64)
 
                 if d_out["dust_emission_sed"] is not None:
                     d_out["dust_emission_sed"][start:end, :] = dust
@@ -1121,10 +1246,8 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
 
             if d_out["total_sed"] is not None:
                 total = (
-                    (atten_all if atten_all is not None
-                     else np.zeros_like(st_block))
-                    + (dust if dust is not None else 0.0)
-                )
+                    atten_all if atten_all is not None else np.zeros_like(st_block)
+                ) + (dust if dust is not None else 0.0)
                 d_out["total_sed"][start:end, :] = total
 
             pbar.update(end - start)
@@ -1137,9 +1260,15 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
             "wavelength in Angstrom (rest)."
         )
         f_out.attrs["dtype"] = "float64"
-        f_out.attrs["E(B-V)"] = float(E_B_V)
         f_out.attrs["Rv_prime"] = float(RV_PRIME)
-        f_out.attrs["z_snapshot"] = float((1.0 / a_now) - 1.0)
+        f_out.attrs["z_snapshot"] = float(z_snapshot)
+        f_out.attrs["E(B-V)"] = float(E_B_V)
+        f_out.attrs["E(B-V)_Hayes_C"] = float(C_EBV_HAYES)
+        f_out.attrs["E(B-V)_Hayes_z_e_fold"] = float(Z_EBV_HAYES)
+        f_out.attrs["Te_table_note"] = (
+            "Te from metallicity: fixed Z=0 value for Z<1e-7, "
+            "logZ-logTe interpolation for Z>=1e-7."
+        )
 
     fs.close()
     fa.close()
@@ -1157,30 +1286,33 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
 # Main
 # =========================
 def main():
-    print("Loading MIST cubes ...")
-    cubes = load_mist_cubes(CUBE_DIR)
-    global CUBES_DICT
-    CUBES_DICT = cubes
+    print("Loading Stellar templates ...")
+    cubes = load_mist_cubes(Stellar_DIR)
     z_keys = np.array(list(cubes.keys()), dtype=float)
 
     print("Loading templates (nebular, AGN) ...")
-    line_raw, cont_raw = load_nebular_templates(
-        NEB_LINE_FILE, NEB_CONT_FILE
-    )
-    angles, lam_agn, skirtor_lib = load_skirtor_templates(
-        SKIRTOR_DIR
-    )
+    line_raw, cont_raw = load_nebular_templates(NEB_LINE_FILE, NEB_CONT_FILE)
+    angles, lam_agn, skirtor_lib = load_skirtor_templates(AGN_DIR)
+
+    # Preload frequently-used snapshot/fof arrays in RAM once
+    snap_mem, fof_mem = preload_runtime_inputs(SNAP, FOF)
 
     # SNAP scalar (scale factor)
-    with h5py.File(SNAP, "r") as f:
-        a_now = float(f["Header"].attrs["Time"])
+    a_now = float(snap_mem["a_now"])
 
-    # Selection
+    z_now = (1.0 / a_now) - 1.0
+    E_B_V_now = ebv_from_redshift(z_now)
+    print(f"Snapshot: a = {a_now:.6f}, z = {z_now:.3f}, E(B-V) = {E_B_V_now:.3f} (Hayes+2011)")
+
+    # Selection + gas metallicity arrays (FOF)
     print("Selecting subhaloes by M★ > 1e9 Msun ...")
-    with h5py.File(FOF, "r") as f:
-        sub_mtype = f["Subhalo/SubhaloMassType"][:, 4].astype(np.float64)
-        Mstar = sub_mtype * MASS_CONV
-        eligible_sids = np.nonzero(Mstar > MSTAR_THRESH)[0].astype(np.int64)
+    sub_mtype = fof_mem["sub_mtype4"]
+    Mstar = sub_mtype * MASS_CONV
+    eligible_sids = np.nonzero(Mstar > MSTAR_THRESH)[0].astype(np.int64)
+
+    # Gas metallicity to use for nebular:
+    Zgas_sfr_all = fof_mem["zgas_sfr"]
+    Zgas_instar_all = fof_mem["zgas_instar"]
 
     N_sel = int(eligible_sids.size)
     print(f"Eligible subhaloes: {N_sel}")
@@ -1188,12 +1320,21 @@ def main():
         print("No subhalo passes the mass threshold. Exiting.")
         return
 
+    Zgas_sfr_sel = Zgas_sfr_all[eligible_sids]
+    Zgas_instar_sel = Zgas_instar_all[eligible_sids]
+    valid = np.isfinite(Zgas_sfr_sel) & (Zgas_sfr_sel > 0.0)
+    Z_gas_sel = np.where(valid, Zgas_sfr_sel, Zgas_instar_sel)
+    # final safety clamp (avoid <=0 or NaN)
+    bad = (~np.isfinite(Z_gas_sel)) | (Z_gas_sel <= 0.0)
+    if np.any(bad):
+        Z_gas_sel[bad] = float(Z_GRID_FOR_TPL[-1])
+
     # Adaptive wavelength grid (target ~30k + line windows)
     lam_lines = line_raw[:, 1].astype(np.float64)
     global ADAPT_WAVE
     ADAPT_WAVE = build_adaptive_wave(
         base_min_A=91.0,
-        base_max_A=1.0e8,
+        base_max_A=1.0e7,
         n_base=30000,
         lam_lines=lam_lines,
         fwhm_kms=FWHM_KMS,
@@ -1212,24 +1353,18 @@ def main():
         safety_gb=10.0,
         hard_cap=15000,
     )
-    rows_chunk_D_capped = cap_rows_chunk_for_hdf5(
-        ADAPT_WAVE.size, rows_chunk_D, dtype=np.float64
-    )
-    print(
-        f"[Planner] Stage D rows_chunk (raw≈{rows_chunk_D}) "
-        f"→ capped={rows_chunk_D_capped} "
-        f"(HDF5 <4GB/chunk, f64)"
-    )
+    rows_chunk_D_capped = cap_rows_chunk_for_hdf5(ADAPT_WAVE.size, rows_chunk_D, dtype=np.float64)
+    print(f"[Planner] Stage D rows_chunk (raw≈{rows_chunk_D}) → capped={rows_chunk_D_capped} (HDF5 <4GB/chunk, f64)")
 
     # Stages
-    stage_stellar(eligible_sids, cubes, z_keys, a_now, TMP_STELLAR)
-    stage_agn(eligible_sids, angles, lam_agn, skirtor_lib, TMP_AGN)
-    stage_nebular(eligible_sids, line_raw, cont_raw,
-                  TMP_STELLAR, TMP_NEB)
+    stage_stellar(eligible_sids, cubes, z_keys, a_now, TMP_STELLAR, fof_mem, snap_mem)
+    stage_agn(eligible_sids, angles, lam_agn, skirtor_lib, TMP_AGN, fof_mem, snap_mem)
+    stage_nebular(eligible_sids, line_raw, cont_raw, TMP_STELLAR, TMP_NEB, Z_gas_sel)
 
-    # Stage D (merge + cleanup)
+    # Stage D (merge + cleanup) with E(B-V)(z)
     stage_merge_and_cleanup(
-        eligible_sids, TMP_STELLAR, TMP_AGN, TMP_NEB, OUT_FINAL, a_now
+        eligible_sids, TMP_STELLAR, TMP_AGN, TMP_NEB,
+        OUT_FINAL, a_now, E_B_V_now
     )
 
     print(f"\n✓ All done. Final file → {os.path.abspath(OUT_FINAL)}")
