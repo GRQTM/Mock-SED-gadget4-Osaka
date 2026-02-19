@@ -77,7 +77,6 @@ _CPU_COUNT = max(1, int(os.cpu_count() or 1))
 # User tuning (edit these values directly for your server profile)
 USER_THREADS = 20
 USER_TARGET_RAM_GB = 150.0
-USER_SAFETY_RAM_GB = 16.0
 USER_BLOCK_ROWS_STAGE_A = 24
 USER_BLOCK_ROWS_STAGE_B = 96
 USER_BLOCK_ROWS_STAGE_C = 24
@@ -87,7 +86,6 @@ USER_MAX_INFLIGHT_BLOCKS = max(2, USER_THREADS * 3)
 N_THREADS = int(os.environ.get("SED_THREADS", str(USER_THREADS)))
 N_THREADS = max(1, min(N_THREADS, _CPU_COUNT))
 TARGET_RAM_GB = float(os.environ.get("SED_TARGET_RAM_GB", str(USER_TARGET_RAM_GB)))
-SAFETY_RAM_GB = float(os.environ.get("SED_SAFETY_RAM_GB", str(USER_SAFETY_RAM_GB)))
 
 # Row-block settings for bounded parallel scheduling.
 BLOCK_ROWS_STAGE_A = max(1, int(os.environ.get("SED_BLOCK_ROWS_STAGE_A", str(USER_BLOCK_ROWS_STAGE_A))))
@@ -125,14 +123,35 @@ T_dust = 25.0
 CASEY_BETA       = 1.60
 CASEY_ALPHA      = 2.0
 CASEY_LAMBDA0_UM = 200.0
+# Casey (2012) Table 1 coefficients for the MIR turnover wavelength (general opacity).
+# Table 1: λ_c ≡ (3/4) L(α,T), where
+#   L(α,T) = [ (b1 + b2 α)^(-2) + (b3 + b4 α) * T ]^(-1)   (in μm)
+CASEY_LC_B1 = 26.68
+CASEY_LC_B2 = 6.246
+CASEY_LC_B3 = 1.905e-4
+CASEY_LC_B4 = 7.243e-5
+
+def casey12_lambda_c_cm(T, alpha):
+    """Return λ_c [cm] using Casey (2012) Table 1 (general opacity; includes the 3/4 factor)."""
+    T = float(T)
+    alpha = float(alpha)
+    L_um = 1.0 / (
+        (CASEY_LC_B1 + CASEY_LC_B2 * alpha)**(-2.0)
+        + (CASEY_LC_B3 + CASEY_LC_B4 * alpha) * T
+    )
+    lam_c_um = 0.75 * L_um
+    return lam_c_um * 1e-4  # μm -> cm
 # Dust energy balance: absorption integration range / dust emission range
-L_ABS_MIN_UM, L_ABS_MAX_UM = 0.0912, 10.0
+# We apply Calzetti attenuation only over 0.12--2.2 um (see k_calzetti_lambda_um).
+# The absorbed energy used for energy-balance dust re-emission is therefore
+# computed over the same UV--NIR range.
+L_ABS_MIN_UM, L_ABS_MAX_UM = 0.12, 2.2
 IR_MIN_UM,  IR_MAX_UM      = 3.0, 1000.0
 
 # Nebular line width.
 FWHM_KMS = 300.0
 
-# Metallicity grid for nebular templates (l₩ine_raw / cont_raw).
+# Metallicity grid for nebular templates (line_raw / cont_raw).
 # The final element is a small placeholder representing the dedicated Z=0 template bin.
 Z_FLOOR_NEB = 1e-7
 Z_GRID_FOR_TPL = np.array(
@@ -435,10 +454,10 @@ def k_calzetti_lambda_um(lam_um, Rv_prime=4.05):
 
     m1 = (lam >= 0.12) & (lam < 0.63)
     m2 = (lam >= 0.63) & (lam <= 2.2)
-    m_low  = lam < 0.12
-    m_high = lam > 2.2
 
-    mask_uv = m1 | m_low
+    # Calzetti et al. (2000) is defined over 0.12--2.2 um.
+    # We intentionally do not extrapolate the law outside this range.
+    mask_uv = m1
     if np.any(mask_uv):
         inv = 1.0 / lam[mask_uv]
         k[mask_uv] = (
@@ -446,7 +465,7 @@ def k_calzetti_lambda_um(lam_um, Rv_prime=4.05):
             + Rv_prime
         )
 
-    mask_opt = m2 | m_high
+    mask_opt = m2
     if np.any(mask_opt):
         inv = 1.0 / lam[mask_opt]
         k[mask_opt] = (
@@ -472,26 +491,6 @@ def inv_expm1_stable(x):
     out[ms] = (1.0 / xs) - 0.5 + (xs / 12.0) - (xs**3) / 720.0
     return out
 
-def solve_lambda_c(T, alpha, beta):
-    """Solve for λ_c [cm] in Casey (2012) definition."""
-    def g(x):
-        if x <= 0:
-            return 1e9
-        ex = math.exp(x)
-        return (3.0 + beta) - (x * ex) / (ex - 1.0) - alpha
-
-    a, b = 1.0e-3, 50.0
-    for _ in range(80):
-        m = 0.5 * (a + b)
-        if g(a) * g(m) <= 0:
-            b = m
-        else:
-            a = m
-    x = 0.5 * (a + b)
-
-    nu_c = x * kB * T / h_ergs
-    return c_cms / nu_c  # [cm]
-
 def _casey_Snu(nu, T, beta, alpha, nu0, nuc):
     """Casey (2012) S_nu(ν)"""
     nu = np.asarray(nu, np.float64)
@@ -507,7 +506,7 @@ def _casey_Snu(nu, T, beta, alpha, nu0, nuc):
         (c_cms**2) * inv_expm1_stable(np.array([x_c]))[0]
     )
 
-    Npl = math.e * S_mbb_c * (nuc**alpha)
+    Npl = S_mbb_c * (nuc**alpha)
     S_pl = Npl * (nu**(-alpha)) * np.exp(-(nuc / nu)**2)
     return S_mbb + S_pl
 
@@ -1101,12 +1100,16 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
     lam_um = ADAPT_WAVE.astype(np.float64) * 1e-4
     k_lam  = k_calzetti_lambda_um(lam_um, Rv_prime=RV_PRIME)
     trans  = np.power(10.0, -0.4 * (k_lam * E_B_V)).astype(np.float64)
+
+    # Enforce: no attenuation outside the Calzetti validity range.
+    # (This is redundant with k_calzetti_lambda_um(), but kept as a safety guard.)
+    trans[(lam_um < 0.12) | (lam_um > 2.2)] = 1.0
     mask_ion = (ADAPT_WAVE <= 912.0)
 
     # Casey shape (row-invariant)
     lam_norm_um = np.geomspace(IR_MIN_UM, IR_MAX_UM, 2000)
     lam_norm_cm = lam_norm_um * 1e-4
-    lam_c_cm    = solve_lambda_c(T_dust, CASEY_ALPHA, CASEY_BETA)
+    lam_c_cm    = casey12_lambda_c_cm(T_dust, CASEY_ALPHA)
     S_shape_norm = casey_Slambda_per_cm(
         lam_norm_cm, T_dust, CASEY_BETA, CASEY_ALPHA,
         CASEY_LAMBDA0_UM, lam_c_cm,
@@ -1274,7 +1277,7 @@ def stage_merge_and_cleanup(eligible_sids, stellar_tmp, agn_tmp, neb_tmp,
     fa.close()
     fn.close()
 
-    for fp in [TMP_STELLAR, TMP_AGN, TMP_NEB]:
+    for fp in [stellar_tmp, agn_tmp, neb_tmp]:
         try:
             if os.path.exists(fp):
                 os.remove(fp)
